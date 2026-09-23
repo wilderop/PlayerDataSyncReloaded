@@ -15,6 +15,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.logging.Logger;
@@ -27,7 +28,9 @@ public class SyncManager {
     private final ConcurrentHashMap<UUID, Boolean> syncInProgress = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Integer> inventoryHashes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Long> lastSaveMillis = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, CompletableFuture<?>> pendingSaves = new ConcurrentHashMap<>();
     private final Set<String> excludedWorlds = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> appliedSnapshots = ConcurrentHashMap.newKeySet();
 
     private final LongAdder loadAttempts = new LongAdder();
     private final LongAdder loadSuccess = new LongAdder();
@@ -42,9 +45,6 @@ public class SyncManager {
     private final AtomicLong lastSaveDurationMs = new AtomicLong(-1L);
     private final AtomicLong lastErrorAt = new AtomicLong(-1L);
     private volatile String lastErrorMessage = "";
-
-    /** Identifies this server on the Redis channel so it can ignore its own published saves. */
-    private final String nodeId = UUID.randomUUID().toString();
 
     private RedisManager redisManager;
     private DiscordWebhookManager discordManager;
@@ -73,34 +73,12 @@ public class SyncManager {
     public void setRedisManager(RedisManager redisManager) {
         this.redisManager = redisManager;
         this.redisManager.subscribe(message -> {
-            if (!message.startsWith("saved:")) {
-                return;
+            if (message.startsWith("saved:")) {
+                String uuidStr = message.substring(6);
+                UUID uuid = UUID.fromString(uuidStr);
+                // Implementation depends on platform to find player and trigger handleJoin
+                // For now, we'll assume the platform handles the event or we need a way to find PDSPlayer
             }
-
-            // Format: saved:<uuid>:<nodeId>. The nodeId is absent in messages from pre-26.8 nodes.
-            String[] parts = message.split(":", 3);
-            if (parts.length >= 3 && nodeId.equals(parts[2])) {
-                // Our own publish echoing back. Reloading here would undo the save we just made.
-                return;
-            }
-
-            UUID uuid;
-            try {
-                uuid = UUID.fromString(parts[1]);
-            } catch (IllegalArgumentException | ArrayIndexOutOfBoundsException ex) {
-                logger.warning("Ignoring malformed Redis message: " + message);
-                return;
-            }
-
-            platform.runTask(() -> {
-                PDSPlayer player = platform.getPlayer(uuid);
-                if (player == null) {
-                    // Player is not on this server — nothing to refresh.
-                    return;
-                }
-                logger.info("Redis: reloading data for " + player.getName() + " after remote save.");
-                handleJoin(player);
-            });
         });
     }
 
@@ -164,7 +142,9 @@ public class SyncManager {
         }
 
         loadAttempts.increment();
-        syncInProgress.put(player.getUniqueId(), true);
+        if (syncInProgress.putIfAbsent(player.getUniqueId(), true) != null) {
+            return;
+        }
 
         String syncStarted = platform.getConfigString("messages.sync_started", "&7Syncing your data...");
         if (!syncStarted.isEmpty()) {
@@ -199,15 +179,15 @@ public class SyncManager {
     private void applyData(PDSPlayer player, PlayerData data, long startTime) {
         if (platform.isOnline(player.getUniqueId())) {
             try {
+                filterData(data);
                 versionHandler.apply(player, data);
 
                 if (platform.getConfigBoolean("sync.economy", true)) {
                     writeBalance(player, data.balance);
                 }
 
-                if (data.inventoryContents != null) {
-                    inventoryHashes.put(player.getUniqueId(), data.inventoryContents.hashCode());
-                }
+                inventoryHashes.put(player.getUniqueId(), snapshotHash(data));
+                appliedSnapshots.add(player.getUniqueId());
 
                 long duration = System.currentTimeMillis() - startTime;
                 lastLoadDurationMs.set(duration);
@@ -222,7 +202,7 @@ public class SyncManager {
                 if (discordManager != null && platform.getConfigBoolean("discord.events.sync_success", true)) {
                     discordManager.sendSyncSuccess(player.getName(), duration);
                 }
-            } catch (Exception ex) {
+            } catch (Throwable ex) {
                 loadFailed.increment();
                 trackError("apply data for " + player.getName(), ex);
             }
@@ -231,13 +211,25 @@ public class SyncManager {
     }
 
     public void handleQuit(PDSPlayer player) {
-        handleQuit(player, false);
+        handleQuit(player, false, false);
     }
 
     public void handleQuit(PDSPlayer player, boolean isAutosave) {
+        handleQuit(player, isAutosave, false);
+    }
+
+    public void handleQuit(PDSPlayer player, boolean isAutosave, boolean force) {
         if (isWorldExcluded(player.getWorldName())) {
             skippedByWorld.increment();
             logger.info("Skipped saving for " + player.getName() + " in excluded world " + player.getWorldName());
+            return;
+        }
+
+        if (!force
+                && platform.getConfigBoolean("sync.only_save_after_successful_load", false)
+                && !appliedSnapshots.contains(player.getUniqueId())) {
+            logger.info("Skipped save for " + player.getName()
+                    + ": no synced snapshot loaded this session (blocks blank first-write, still saves real drops after a load)");
             return;
         }
 
@@ -263,30 +255,46 @@ public class SyncManager {
         }
         filterData(data); // Apply config filters
 
-        if (data.inventoryContents != null) {
-            int currentHash = data.inventoryContents.hashCode();
-            Integer lastHash = inventoryHashes.get(player.getUniqueId());
-            if (lastHash != null && lastHash == currentHash && !platform.getConfigBoolean("sync.force_save_on_quit", false)) {
-                skippedByHash.increment();
-                return;
-            }
-        } else {
-            inventoryHashes.remove(player.getUniqueId());
+        int currentHash = snapshotHash(data);
+        Integer lastHash = inventoryHashes.get(player.getUniqueId());
+        if (!force && lastHash != null && lastHash == currentHash
+                && !platform.getConfigBoolean("sync.force_save_on_quit", false)) {
+            skippedByHash.increment();
+            return;
         }
 
+        if (platform.getConfigBoolean("sync.merge_existing_fields", false)) {
+            storage.load(player.getUniqueId()).thenAccept(existing -> {
+                PlayerData toSave = existing.map(e -> mergeUnsetFields(e, data)).orElse(data);
+                persist(player, toSave, isAutosave);
+            }).exceptionally(ex -> {
+                trackError("merge existing data for " + player.getName(), ex);
+                persist(player, data, isAutosave);
+                return null;
+            });
+            return;
+        }
+
+        persist(player, data, isAutosave);
+    }
+
+    private void persist(PDSPlayer player, PlayerData data, boolean isAutosave) {
         long startTime = System.currentTimeMillis();
-        storage.save(data).thenRun(() -> {
+        UUID uuid = player.getUniqueId();
+        CompletableFuture<Void> fut = storage.save(data).thenRun(() -> {
             long duration = System.currentTimeMillis() - startTime;
             lastSaveDurationMs.set(duration);
             saveSuccess.increment();
-            lastSaveMillis.put(player.getUniqueId(), System.currentTimeMillis());
-            if (data.inventoryContents != null) {
-                inventoryHashes.put(player.getUniqueId(), data.inventoryContents.hashCode());
+            lastSaveMillis.put(uuid, System.currentTimeMillis());
+            inventoryHashes.put(uuid, snapshotHash(data));
+            if (platform.getConfigBoolean("snapshots.enabled", true)) {
+                String serverId = platform.getConfigString("server-id", "unknown");
+                storage.saveDailySnapshot(serverId, data);
             }
             if (!isAutosave) {
                 logger.info("Saved data for player: " + player.getName());
                 if (redisManager != null) {
-                    redisManager.publish("saved:" + player.getUniqueId() + ":" + nodeId);
+                    redisManager.publish("saved:" + uuid);
                 }
             }
         }).exceptionally(ex -> {
@@ -294,6 +302,56 @@ public class SyncManager {
             trackError("save data for " + player.getName(), ex);
             return null;
         });
+        pendingSaves.put(uuid, fut);
+        fut.whenComplete((ok, err) -> pendingSaves.remove(uuid, fut));
+    }
+
+    /** Capture current online inventories and wait for SQL so a JVM stop cannot drop them. */
+    public void awaitPendingSaves(long timeoutMs) {
+        CompletableFuture<?>[] all = pendingSaves.values().toArray(CompletableFuture[]::new);
+        if (all.length == 0) {
+            return;
+        }
+        logger.info("Waiting for " + all.length + " player data save(s) to finish...");
+        try {
+            CompletableFuture.allOf(all).get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            logger.warning("Player data flush did not finish in " + timeoutMs + "ms: " + e.getMessage());
+        }
+    }
+
+    /** Wait for one player's in-flight SQL save (server switch / gate). */
+    public void awaitPendingSave(UUID uuid, long timeoutMs) {
+        CompletableFuture<?> fut = pendingSaves.get(uuid);
+        if (fut == null) {
+            return;
+        }
+        try {
+            fut.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            logger.warning("Player data flush for " + uuid + " did not finish in "
+                    + timeoutMs + "ms: " + e.getMessage());
+        }
+    }
+
+    /** Inventory + ender chest. Hashing only the hotbar skipped echest-only edits. */
+    private static int snapshotHash(PlayerData data) {
+        int h = 1;
+        h = 31 * h + (data.inventoryContents == null ? 0 : data.inventoryContents.hashCode());
+        h = 31 * h + (data.enderChestContents == null ? 0 : data.enderChestContents.hashCode());
+        return h;
+    }
+
+    private PlayerData mergeUnsetFields(PlayerData existing, PlayerData captured) {
+        if (captured.enderChestContents == null) captured.enderChestContents = existing.enderChestContents;
+        if (captured.potionEffects == null) captured.potionEffects = existing.potionEffects;
+        if (captured.advancements == null) captured.advancements = existing.advancements;
+        if (captured.statistics == null) captured.statistics = existing.statistics;
+        if (captured.attributes == null) captured.attributes = existing.attributes;
+        if (captured.persistentDataContainer == null) captured.persistentDataContainer = existing.persistentDataContainer;
+        if (captured.healthScale <= 0) captured.healthScale = existing.healthScale > 0 ? existing.healthScale : 20.0;
+        if (captured.health <= 0) captured.health = existing.health > 0 ? existing.health : 20.0;
+        return captured;
     }
 
     private void filterData(PlayerData data) {
@@ -311,14 +369,6 @@ public class SyncManager {
             data.saturation = 5.0f;
         }
         if (!platform.getConfigBoolean("sync.game_mode", true)) data.gameMode = "SURVIVAL";
-        if (!platform.getConfigBoolean("sync.flight", true)) {
-            data.isFlying = false;
-            data.canFly = false;
-        }
-        if (!platform.getConfigBoolean("sync.attributes", true)) data.attributes = null;
-        if (!platform.getConfigBoolean("sync.pdc", true)) data.persistentDataContainer = null;
-        // Location restore is opt-in: it teleports on join, so it must never turn on by surprise.
-        if (!platform.getConfigBoolean("sync.location", false)) data.worldName = null;
         if (!platform.getConfigBoolean("sync.advancements", true)) data.advancements = null;
         if (!platform.getConfigBoolean("sync.statistics", true)) data.statistics = null;
         if (!platform.getConfigBoolean("sync.air_level", true)) data.airLevel = 300;
@@ -337,6 +387,19 @@ public class SyncManager {
 
     public boolean isSyncInProgress(UUID uuid) {
         return syncInProgress.getOrDefault(uuid, false);
+    }
+
+    public void forceApply(PDSPlayer player, PlayerData data) {
+        applyData(player, data, System.currentTimeMillis());
+        appliedSnapshots.add(player.getUniqueId());
+    }
+
+    public Storage getStorage() {
+        return storage;
+    }
+
+    public VersionHandler getVersionHandler() {
+        return versionHandler;
     }
 
     public CompletableFuture<Optional<PlayerData>> loadStoredData(UUID uuid) {

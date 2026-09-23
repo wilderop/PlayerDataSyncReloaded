@@ -11,6 +11,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -88,7 +90,7 @@ public class SqlStorage implements Storage {
         String createTableSql = "CREATE TABLE IF NOT EXISTS player_data (" +
                 "uuid VARCHAR(36) PRIMARY KEY," +
                 "name VARCHAR(16) NOT NULL," +
-                "data TEXT NOT NULL," +
+                "data LONGTEXT NOT NULL," +
                 "last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP" +
                 ")";
         
@@ -99,8 +101,25 @@ public class SqlStorage implements Storage {
 
             // Check for missing columns (migration from legacy versions)
             checkAndAddColumn(conn, "name", "VARCHAR(16) NOT NULL DEFAULT 'Unknown'");
-            checkAndAddColumn(conn, "data", "TEXT");
+            checkAndAddColumn(conn, "data", "LONGTEXT");
+            try (PreparedStatement ps = conn.prepareStatement("ALTER TABLE player_data MODIFY COLUMN data LONGTEXT NOT NULL")) {
+                ps.execute();
+            } catch (SQLException ignored) {
+            }
             checkAndAddColumn(conn, "last_updated", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+
+            String snapshotsSql = "CREATE TABLE IF NOT EXISTS inventory_snapshots (" +
+                    "uuid VARCHAR(36) NOT NULL," +
+                    "name VARCHAR(16) NOT NULL," +
+                    "server_id VARCHAR(32) NOT NULL," +
+                    "snap_date DATE NOT NULL," +
+                    "taken_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP," +
+                    "data LONGTEXT NOT NULL," +
+                    "PRIMARY KEY (uuid, server_id, snap_date)" +
+                    ")";
+            try (PreparedStatement ps = conn.prepareStatement(snapshotsSql)) {
+                ps.execute();
+            }
 
             // Special migration: Handle 'data_json' column found in some older Reloaded versions
             if (columnExists(conn, "data_json")) {
@@ -159,7 +178,7 @@ public class SqlStorage implements Storage {
         if (dbExecutor != null) {
             dbExecutor.shutdown();
             try {
-                if (!dbExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                if (!dbExecutor.awaitTermination(15, TimeUnit.SECONDS)) {
                     dbExecutor.shutdownNow();
                 }
             } catch (InterruptedException e) {
@@ -304,5 +323,96 @@ public class SqlStorage implements Storage {
             }
             return uuids;
         }, dbExecutor);
+    }
+
+    @Override
+    public CompletableFuture<Void> saveDailySnapshot(String serverId, PlayerData data) {
+        return CompletableFuture.runAsync(() -> {
+            String sql = dbType.equals("postgres")
+                    ? "INSERT INTO inventory_snapshots (uuid, name, server_id, snap_date, taken_at, data) VALUES (?, ?, ?, CURRENT_DATE, CURRENT_TIMESTAMP, ?) "
+                    + "ON CONFLICT (uuid, server_id, snap_date) DO UPDATE SET name = EXCLUDED.name, taken_at = EXCLUDED.taken_at, data = EXCLUDED.data"
+                    : "INSERT INTO inventory_snapshots (uuid, name, server_id, snap_date, taken_at, data) VALUES (?, ?, ?, CURDATE(), CURRENT_TIMESTAMP, ?) "
+                    + "ON DUPLICATE KEY UPDATE name = VALUES(name), taken_at = VALUES(taken_at), data = VALUES(data)";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, data.uuid.toString());
+                ps.setString(2, data.name == null ? "Unknown" : data.name);
+                ps.setString(3, serverId);
+                ps.setString(4, gson.toJson(data));
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                logger.log(Level.SEVERE, "Could not save inventory snapshot for " + data.uuid, e);
+            }
+        }, dbExecutor);
+    }
+
+    @Override
+    public CompletableFuture<Optional<InventorySnapshot>> findSnapshotAtOrBefore(UUID uuid, String serverId, Instant target) {
+        return CompletableFuture.supplyAsync(() -> {
+            String sql = "SELECT uuid, name, server_id, taken_at, data FROM inventory_snapshots "
+                    + "WHERE uuid = ? AND server_id = ? AND taken_at <= ? ORDER BY taken_at DESC LIMIT 1";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, serverId);
+                ps.setTimestamp(3, Timestamp.from(target));
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return Optional.of(readSnapshot(rs));
+                    }
+                }
+            } catch (SQLException e) {
+                logger.log(Level.SEVERE, "Could not load inventory snapshot for " + uuid, e);
+            }
+            return Optional.empty();
+        }, dbExecutor);
+    }
+
+    @Override
+    public CompletableFuture<List<InventorySnapshot>> listSnapshots(UUID uuid, String serverId) {
+        return CompletableFuture.supplyAsync(() -> {
+            List<InventorySnapshot> out = new ArrayList<>();
+            String sql = "SELECT uuid, name, server_id, taken_at, data FROM inventory_snapshots "
+                    + "WHERE uuid = ? AND server_id = ? ORDER BY taken_at DESC";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, serverId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(readSnapshot(rs));
+                    }
+                }
+            } catch (SQLException e) {
+                logger.log(Level.SEVERE, "Could not list inventory snapshots for " + uuid, e);
+            }
+            return out;
+        }, dbExecutor);
+    }
+
+    @Override
+    public CompletableFuture<Integer> pruneSnapshotsOlderThanDays(int days) {
+        return CompletableFuture.supplyAsync(() -> {
+            String sql = dbType.equals("postgres")
+                    ? "DELETE FROM inventory_snapshots WHERE taken_at < (CURRENT_TIMESTAMP - (? * INTERVAL '1 day'))"
+                    : "DELETE FROM inventory_snapshots WHERE taken_at < DATE_SUB(NOW(), INTERVAL ? DAY)";
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setInt(1, days);
+                return ps.executeUpdate();
+            } catch (SQLException e) {
+                logger.log(Level.SEVERE, "Could not prune inventory snapshots", e);
+                return 0;
+            }
+        }, dbExecutor);
+    }
+
+    private InventorySnapshot readSnapshot(ResultSet rs) throws SQLException {
+        UUID uuid = UUID.fromString(rs.getString("uuid"));
+        String name = rs.getString("name");
+        String serverId = rs.getString("server_id");
+        Instant takenAt = rs.getTimestamp("taken_at").toInstant();
+        PlayerData data = gson.fromJson(rs.getString("data"), PlayerData.class);
+        return new InventorySnapshot(uuid, name, serverId, takenAt, data);
     }
 }

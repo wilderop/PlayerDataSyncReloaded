@@ -15,4 +15,9 @@ public interface Storage {
     CompletableFuture<Optional<PlayerData>> loadLegacy(UUID uuid);
 
     CompletableFuture<java.util.List<UUID>> getAllStoredUUIDs();
+
+    CompletableFuture<Void> saveDailySnapshot(String serverId, PlayerData data);
+    CompletableFuture<Optional<InventorySnapshot>> findSnapshotAtOrBefore(UUID uuid, String serverId, java.time.Instant target);
+    CompletableFuture<java.util.List<InventorySnapshot>> listSnapshots(UUID uuid, String serverId);
+    CompletableFuture<Integer> pruneSnapshotsOlderThanDays(int days);
 }

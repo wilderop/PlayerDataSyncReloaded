@@ -139,4 +139,25 @@ public class MongoStorage implements Storage {
             return uuids;
         }, dbExecutor);
     }
+
+    @Override
+    public CompletableFuture<Void> saveDailySnapshot(String serverId, PlayerData data) {
+        logger.warning("Inventory snapshots are not supported on MongoDB storage.");
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Override
+    public CompletableFuture<Optional<InventorySnapshot>> findSnapshotAtOrBefore(UUID uuid, String serverId, java.time.Instant target) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<List<InventorySnapshot>> listSnapshots(UUID uuid, String serverId) {
+        return CompletableFuture.completedFuture(List.of());
+    }
+
+    @Override
+    public CompletableFuture<Integer> pruneSnapshotsOlderThanDays(int days) {
+        return CompletableFuture.completedFuture(0);
+    }
 }
