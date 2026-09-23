@@ -25,7 +25,7 @@ Open your `config.yml` and locate the `migration` block. Enter the credentials f
 ```yaml
 migration:
   type: "mongodb" # Options: mysql, mariadb, postgres, mongodb
-  connection_url: "mongodb+srv://admin:password@cluster.example.com/pds"
+  connection_url: ""
   legacy: false # Set to true only if importing from the original PlayerDataSync
 ```
 
