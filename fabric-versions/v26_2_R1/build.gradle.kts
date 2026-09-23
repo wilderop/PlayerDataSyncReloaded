@@ -14,6 +14,13 @@ loom {
     decompilers { clear() }
 }
 
+tasks.named<net.fabricmc.loom.task.RemapJarTask>("remapJar") {
+    // Minecraft 26.2 + Fabric Loader run with official Mojmap names
+    // ("Mappings not present!"). Yarn 1.21.11 remaps NbtIo/NbtOps/SharedConstants
+    // to class_2507/class_2509/class_155, which do not exist and crash on join.
+    targetNamespace.set("named")
+}
+
 dependencies {
     minecraft("com.mojang:minecraft:26.2")
     mappings("net.fabricmc:yarn:1.21.11+build.6:v2")

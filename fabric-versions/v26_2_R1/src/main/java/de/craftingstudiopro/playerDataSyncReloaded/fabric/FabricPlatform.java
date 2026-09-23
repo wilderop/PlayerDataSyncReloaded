@@ -43,12 +43,6 @@ public class FabricPlatform implements Platform {
     }
 
     @Override
-    public de.craftingstudiopro.playerDataSyncReloaded.api.PDSPlayer getPlayer(UUID uuid) {
-        ServerPlayer player = server.getPlayerList().getPlayer(uuid);
-        return player != null ? new FabricPDSPlayer(player) : null;
-    }
-
-    @Override
     public void sendMessage(UUID uuid, String message) {
         ServerPlayer player = server.getPlayerList().getPlayer(uuid);
         if (player != null) {
