@@ -22,7 +22,8 @@ public class VersionHandlerImpl extends BukkitBaseVersionHandler {
         org.bukkit.Registry.ATTRIBUTE.forEach(attr -> {
             AttributeInstance inst = player.getAttribute(attr);
             if (inst != null) {
-                attrMap.put(attr.getKey().asString(), inst.getBaseValue());
+                String key = attr.getKey().asString();
+                attrMap.put(key, sanitizeSpeedAttribute(key, inst.getBaseValue()));
             }
         });
         data.attributes = attrMap;
@@ -40,10 +41,10 @@ public class VersionHandlerImpl extends BukkitBaseVersionHandler {
             data.attributes.forEach((key, val) -> {
                 try {
                     org.bukkit.attribute.Attribute attr = org.bukkit.Registry.ATTRIBUTE.get(org.bukkit.NamespacedKey.fromString(key));
-                    if (attr != null) {
+                    if (attr != null && val != null) {
                         AttributeInstance inst = player.getAttribute(attr);
                         if (inst != null) {
-                            inst.setBaseValue(val);
+                            inst.setBaseValue(sanitizeSpeedAttribute(key, val));
                         }
                     }
                 } catch (Exception ignored) {
