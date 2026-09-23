@@ -2,6 +2,7 @@ package de.craftingstudiopro.playerDataSyncReloaded.common;
 
 import de.craftingstudiopro.playerDataSyncReloaded.api.PlayerData;
 import de.craftingstudiopro.playerDataSyncReloaded.api.VersionHandler;
+import de.craftingstudiopro.playerDataSyncReloaded.common.util.PortableJson;
 import de.craftingstudiopro.playerDataSyncReloaded.common.util.SerializationUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
@@ -18,6 +19,14 @@ import java.util.*;
 
 public abstract class BukkitBaseVersionHandler implements VersionHandler {
     protected List<String> itemExclusions = new ArrayList<>();
+
+    private static boolean syncEnabled(String key, boolean def) {
+        org.bukkit.plugin.Plugin p = Bukkit.getPluginManager().getPlugin("PlayerDataSyncReloaded");
+        if (p == null) {
+            return def;
+        }
+        return p.getConfig().getBoolean("sync." + key, def);
+    }
 
     @Override
     public void setItemExclusions(List<String> materials) {
@@ -61,10 +70,16 @@ public abstract class BukkitBaseVersionHandler implements VersionHandler {
             data.walkSpeed = player.getWalkSpeed();
             data.flySpeed = player.getFlySpeed();
             data.fallDistance = player.getFallDistance();
+            if (data.walkSpeed <= 0.0f || data.walkSpeed > 1.0f) {
+                data.walkSpeed = 0.2f;
+            }
+            if (data.flySpeed <= 0.0f || data.flySpeed > 1.0f) {
+                data.flySpeed = 0.1f;
+            }
         } catch (NoSuchMethodError ignored) {}
 
-        // Effects
-        data.potionEffects = SerializationUtil.toBase64(player.getActivePotionEffects());
+        // Effects (JSON so Fabric can apply the same payload)
+        data.potionEffects = effectsToJson(player);
 
         // Location
         Location loc = player.getLocation();
@@ -90,11 +105,39 @@ public abstract class BukkitBaseVersionHandler implements VersionHandler {
         // Attributes
         data.attributes = captureAttributes(player);
 
-        // Stats & Advancements
-        data.statistics = SerializationUtil.toBase64(captureStatistics(player));
-        data.advancements = SerializationUtil.toBase64(captureAdvancements(player));
+        // Stats & Advancements. Walking the full advancement tree on the main
+        // thread freezes every online player for seconds on busy survival joins.
+        if (syncEnabled("statistics", true)) {
+            data.statistics = PortableJson.statsToJson(captureStatistics(player));
+        }
+        if (syncEnabled("advancements", true)) {
+            data.advancements = PortableJson.advancementsToJson(captureAdvancements(player));
+        }
 
         return data;
+    }
+
+    /**
+     * Legacy Bukkit-object payloads only. Paper 26.2 writes SlotDataFormat v2
+     * JSON here; {@code fromBase64} throws and used to be swallowed, so Fabric
+     * ender-chest edits never appeared on Paper. 26.2 overrides this.
+     */
+    protected void applyEnderChest(PDSPlayer pdsPlayer, String payload) {
+        if (payload == null || payload.isBlank()) {
+            return;
+        }
+        if (SlotDataFormat.kind(payload) == SlotDataFormat.Kind.V2
+                || SlotDataFormat.kind(payload) == SlotDataFormat.Kind.EMPTY) {
+            return;
+        }
+        try {
+            Player player = (Player) pdsPlayer.getHandle();
+            ItemStack[] ec = (ItemStack[]) SerializationUtil.fromBase64(payload);
+            player.getEnderChest().setContents(filterItems(ec));
+        } catch (Exception e) {
+            Bukkit.getLogger().warning("[PlayerDataSync] Could not apply ender chest for "
+                    + pdsPlayer.getName() + ": " + e.getMessage());
+        }
     }
 
     @Override
@@ -122,24 +165,28 @@ public abstract class BukkitBaseVersionHandler implements VersionHandler {
         try {
             player.setAllowFlight(data.canFly);
             player.setFlying(data.isFlying);
-            player.setWalkSpeed(data.walkSpeed);
-            player.setFlySpeed(data.flySpeed);
+            // walkSpeed/flySpeed default to 0f on a fresh PlayerData; applying that
+            // zeroes minecraft:movement_speed and freezes WASD.
+            if (data.walkSpeed > 0.0f && data.walkSpeed <= 1.0f) {
+                player.setWalkSpeed(data.walkSpeed);
+            } else {
+                player.setWalkSpeed(0.2f);
+            }
+            if (data.flySpeed > 0.0f && data.flySpeed <= 1.0f) {
+                player.setFlySpeed(data.flySpeed);
+            } else {
+                player.setFlySpeed(0.1f);
+            }
             player.setFallDistance(data.fallDistance);
         } catch (NoSuchMethodError ignored) {}
 
         // Effects
         player.getActivePotionEffects().forEach(e -> player.removePotionEffect(e.getType()));
-        try {
-            Collection<PotionEffect> effects = (Collection<PotionEffect>) SerializationUtil.fromBase64(data.potionEffects);
-            player.addPotionEffects(effects);
-        } catch (Exception ignored) {}
+        applyPotionEffects(player, data.potionEffects);
 
         // Inventory
         deserializeInventory(pdsPlayer, data.inventoryContents);
-        try {
-            ItemStack[] ec = (ItemStack[]) SerializationUtil.fromBase64(data.enderChestContents);
-            player.getEnderChest().setContents(filterItems(ec));
-        } catch (Exception ignored) {}
+        applyEnderChest(pdsPlayer, data.enderChestContents);
         
         player.getInventory().setHeldItemSlot(data.selectedSlot);
 
@@ -156,43 +203,45 @@ public abstract class BukkitBaseVersionHandler implements VersionHandler {
 
         // Stats & Advancements
         try {
-            applyStatistics(player, (Map<String, Integer>) SerializationUtil.fromBase64(data.statistics));
-            applyAdvancements(player, (java.util.List<String>) SerializationUtil.fromBase64(data.advancements));
+            if (syncEnabled("statistics", true)) {
+                applyStatistics(player, readStatistics(data.statistics));
+            }
+            if (syncEnabled("advancements", true)) {
+                applyAdvancements(player, readAdvancements(data.advancements));
+            }
         } catch (Exception ignored) {}
 
-        // Time & Weather
-        if (data.playerTime != -1) {
-            player.setPlayerTime(data.playerTime, false);
-        } else {
-            player.resetPlayerTime();
-        }
-        if (data.playerWeather != null) {
-            try {
-                player.setPlayerWeather(org.bukkit.WeatherType.valueOf(data.playerWeather));
-            } catch (Exception ignored) {}
-        } else {
-            player.resetPlayerWeather();
-        }
-
-        // Location: filterData() nulls worldName unless sync.location is on, so this is the opt-in gate.
-        // The target world only exists if the destination server actually has it loaded.
-        if (data.worldName != null) {
-            org.bukkit.World world = Bukkit.getWorld(data.worldName);
-            if (world == null) {
-                Bukkit.getLogger().warning("[PlayerDataSync] Skipping location restore for " + player.getName()
-                        + ": world '" + data.worldName + "' does not exist on this server.");
-            } else {
-                player.teleport(new Location(world, data.x, data.y, data.z, data.yaw, data.pitch));
-            }
-        }
+        // Never apply a frozen personal clock. setPlayerTime(t, false) makes each
+        // client see a different stuck time of day (sunrise vs night vs day).
+        player.resetPlayerTime();
+        player.resetPlayerWeather();
     }
     
+    protected static boolean isSpeedAttribute(String id) {
+        if (id == null) {
+            return false;
+        }
+        String s = id.toLowerCase();
+        return s.contains("movement_speed") || s.contains("flying_speed")
+                || s.endsWith("walking_speed") || s.contains("generic.movement_speed")
+                || s.contains("generic_movement_speed");
+    }
+
+    /** Vanilla movement_speed is 0.1; flying_speed is 0.05. Never persist or apply 0. */
+    protected static double sanitizeSpeedAttribute(String id, double value) {
+        if (!isSpeedAttribute(id) || value > 0.0) {
+            return value;
+        }
+        String s = id.toLowerCase();
+        return s.contains("flying") ? 0.05 : 0.1;
+    }
+
     protected Map<String, Double> captureAttributes(Player player) {
         Map<String, Double> map = new HashMap<>();
         for (Attribute attr : Attribute.values()) {
             AttributeInstance inst = player.getAttribute(attr);
             if (inst != null) {
-                map.put(attr.name(), inst.getBaseValue());
+                map.put(attr.name(), sanitizeSpeedAttribute(attr.name(), inst.getBaseValue()));
             }
         }
         return map;
@@ -202,9 +251,14 @@ public abstract class BukkitBaseVersionHandler implements VersionHandler {
         if (attributes == null) return;
         attributes.forEach((name, value) -> {
             try {
+                if (value == null) {
+                    return;
+                }
                 Attribute attr = Attribute.valueOf(name);
                 AttributeInstance inst = player.getAttribute(attr);
-                if (inst != null) inst.setBaseValue(value);
+                if (inst != null) {
+                    inst.setBaseValue(sanitizeSpeedAttribute(name, value));
+                }
             } catch (Exception ignored) {}
         });
     }
@@ -225,9 +279,97 @@ public abstract class BukkitBaseVersionHandler implements VersionHandler {
         if (stats == null) return;
         stats.forEach((name, val) -> {
             try {
-                player.setStatistic(org.bukkit.Statistic.valueOf(name), val);
+                org.bukkit.Statistic stat = org.bukkit.Statistic.valueOf(name);
+                if (stat.getType() != org.bukkit.Statistic.Type.UNTYPED) return;
+                int current = player.getStatistic(stat);
+                player.setStatistic(stat, Math.max(current, val));
             } catch (Exception ignored) {}
         });
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Integer> readStatistics(String raw) {
+        if (raw == null || raw.isEmpty()) return null;
+        if (de.craftingstudiopro.playerDataSyncReloaded.common.util.PortableJson.isJsonObject(raw)) {
+            return de.craftingstudiopro.playerDataSyncReloaded.common.util.PortableJson.statsFromJson(raw);
+        }
+        try {
+            return (Map<String, Integer>) SerializationUtil.fromBase64(raw);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String effectsToJson(Player player) {
+        com.google.gson.JsonArray arr = new com.google.gson.JsonArray();
+        for (PotionEffect effect : player.getActivePotionEffects()) {
+            com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+            org.bukkit.NamespacedKey key = effect.getType().getKey();
+            o.addProperty("id", key != null ? key.toString() : effect.getType().getName());
+            o.addProperty("amplifier", effect.getAmplifier());
+            int dur = effect.getDuration();
+            o.addProperty("duration", dur < 0 ? -1 : dur);
+            o.addProperty("ambient", effect.isAmbient());
+            o.addProperty("particles", effect.hasParticles());
+            o.addProperty("icon", effect.hasIcon());
+            arr.add(o);
+        }
+        return arr.toString();
+    }
+
+    private void applyPotionEffects(Player player, String raw) {
+        if (raw == null || raw.isEmpty()) return;
+        if (de.craftingstudiopro.playerDataSyncReloaded.common.util.PortableJson.isJsonArray(raw)) {
+            com.google.gson.JsonArray arr = de.craftingstudiopro.playerDataSyncReloaded.common.util.PortableJson.parseArray(raw);
+            for (com.google.gson.JsonElement el : arr) {
+                if (!el.isJsonObject()) continue;
+                com.google.gson.JsonObject o = el.getAsJsonObject();
+                if (!o.has("id")) continue;
+                try {
+                    org.bukkit.potion.PotionEffectType type = org.bukkit.potion.PotionEffectType.getByKey(
+                            org.bukkit.NamespacedKey.fromString(o.get("id").getAsString()));
+                    if (type == null) {
+                        type = org.bukkit.potion.PotionEffectType.getByName(o.get("id").getAsString());
+                    }
+                    if (type == null) continue;
+                    int duration = o.has("duration") ? o.get("duration").getAsInt() : 200;
+                    if (duration < 0) duration = Integer.MAX_VALUE;
+                    int amp = o.has("amplifier") ? o.get("amplifier").getAsInt() : 0;
+                    boolean ambient = o.has("ambient") && o.get("ambient").getAsBoolean();
+                    boolean particles = !o.has("particles") || o.get("particles").getAsBoolean();
+                    boolean icon = !o.has("icon") || o.get("icon").getAsBoolean();
+                    player.addPotionEffect(new PotionEffect(type, duration, amp, ambient, particles, icon));
+                } catch (Exception ignored) {
+                }
+            }
+            return;
+        }
+        try {
+            Collection<PotionEffect> effects = (Collection<PotionEffect>) SerializationUtil.fromBase64(raw);
+            player.addPotionEffects(effects);
+        } catch (Exception ignored) {
+        }
+    }
+
+    protected List<String> readAdvancements(String raw) {
+        if (PortableJson.isJsonArray(raw)) {
+            return PortableJson.advancementsFromJson(raw);
+        }
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        try {
+            Object o = SerializationUtil.fromBase64(raw);
+            if (o instanceof List<?> list) {
+                List<String> out = new ArrayList<>();
+                for (Object e : list) {
+                    if (e != null) out.add(e.toString());
+                }
+                return out;
+            }
+        } catch (Exception ignored) {
+        }
+        return List.of();
     }
 
     protected java.util.List<String> captureAdvancements(Player player) {

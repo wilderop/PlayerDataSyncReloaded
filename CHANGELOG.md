@@ -2,24 +2,15 @@
 
 All notable changes to PlayerDataSyncReloaded will be documented in this file.
 
-## [26.8-ALPHA] - 2026-07-31
+## [26.9.4-azpbmd] - 2026-09-07
 ### Fixed
-- **Dead config toggles**: `sync.attributes`, `sync.pdc` and `sync.flight` were declared in `config.yml` but never evaluated in `SyncManager#filterData`, so switching them off had no effect. Same bug class as the `sync.economy` fix in 26.7.
-- **Item exclusions on Fabric**: `exclusions.items` was stored by `FabricVersionHandler` and never read, so excluded items synced anyway. Both the namespaced ID (`minecraft:diamond`) and the Bukkit-style name (`DIAMOND`) are accepted.
+- **Paper ignored Fabric ender chests**: inventory used SlotDataFormat v2, but `apply()` still ran Bukkit `fromBase64` on `enderChestContents` and swallowed the exception. Paper kept the local player.dat chest, so Fabric → Paper looked like a no-op. 26.2 now decodes v2 ender chests the same way as inventory.
 
-### Added
-- **Location sync**: Player position was captured and written to storage but never restored — no teleport existed anywhere in the codebase. Joining players are now teleported to their stored position. Guarded by `sync.location`, which **defaults to `false`**: it only works when the destination server has a world of the same name, and enabling it by default would have started teleporting players on upgrade. When the world is missing, the restore is skipped with a warning instead of dropping the player somewhere wrong.
-- **Redis live sync**: The subscribe handler parsed the incoming UUID and then did nothing — publishing worked, but no server ever acted on it. Receiving servers now reload that player's data if they are online locally. Messages carry a per-server node ID (`saved:<uuid>:<nodeId>`) so a server ignores its own publishes rather than reloading over the save it just made.
-- **Config support for Fabric**: `FabricPlatform` returned hardcoded defaults for every lookup, so no `sync.*` toggle worked on Fabric at all. A `playerdatasync.properties` file is now created in the Fabric config directory on first start, using the same dotted keys as the Bukkit config. Storage settings (`storage.type`, `storage.host`, …) are read from it as well, instead of the previously hardcoded SQLite database.
-- **Fabric data coverage (MC 26.x)**: Ender chest, potion effects and attributes are now synchronized alongside inventory, health, food, experience and game mode.
-- **`Platform#getPlayer(UUID)`**: Resolves an online player, which the Redis listener needs since it only receives a UUID.
-
-### Known issues
-- **Fabric is not yet at full parity with Bukkit.** Advancements and statistics are still not synchronized on any Fabric version. The 1.20 and 1.21 modules also still lack ender chest, potion effects and attributes — only the 26.x modules gained those. Planned for 26.8-BETA.
-- Forge remains excluded from the build (ForgeGradle 6.0.x does not support Gradle 9+); the `Platform#getPlayer` implementations there are written but not compile-verified.
-
-### Notes
-- **This is an alpha.** The economy fix from 26.7, the new location teleport and the Redis live sync have all been verified to compile and are code-reviewed, but none of them have been exercised against a running server with Vault, Redis or a multi-server setup. Test on a staging server before deploying to production.
+## [26.9.3-azpbmd] - 2026-09-07
+### Fixed
+- **Ender chest skipped on save**: the dirty-check hashed only `inventoryContents`, so an ender-chest-only change was treated as "nothing to write". Paper still reached Fabric (Velocity fast-save + Paper player.dat import); Fabric never wrote back.
+- **Fabric quit save**: disconnect now force-saves and waits up to 2s for SQL so Paper does not load a stale row. `flushPlayerNow` lets SkyWorlds persist before the Velocity switch.
+- **`only_save_after_successful_load`**: a forced save (quit / gate / plugin message) no longer gets skipped when the join load had not been marked applied.
 
 ## [26.7-Release] - 2026-07-31
 ### Fixed

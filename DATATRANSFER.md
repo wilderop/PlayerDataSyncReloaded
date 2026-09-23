@@ -20,7 +20,7 @@ storage:
 
 migration:
   type: "mongodb"
-  connection_url: "mongodb://localhost:27017"
+  connection_url: ""
   database: "minecraft_reloaded"
 ```
 

@@ -12,12 +12,7 @@ import java.util.Properties;
 import java.util.logging.Logger;
 
 /**
- * Flat key/value config for the platforms that have no config system of their own
- * (Fabric, Forge). Bukkit keeps using its own YAML config.
- *
- * <p>Keys are the same dotted paths the Bukkit config uses, e.g. {@code sync.inventory},
- * so {@link SyncManager} does not need to know which platform it is running on.
- * List values are comma-separated.
+ * Flat key/value config for Fabric/Forge. Keys match Bukkit dotted paths.
  */
 public class FileConfig {
     private final Properties properties = new Properties();
@@ -47,7 +42,6 @@ public class FileConfig {
     private void writeDefaults(Path file) throws IOException {
         try (InputStream defaults = FileConfig.class.getResourceAsStream("/playerdatasync.properties")) {
             if (defaults == null) {
-                // No bundled template: an empty file still lets getters fall back to their defaults.
                 Files.createFile(file);
                 return;
             }
