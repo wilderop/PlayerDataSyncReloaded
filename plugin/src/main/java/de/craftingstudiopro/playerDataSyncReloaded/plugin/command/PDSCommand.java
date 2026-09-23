@@ -87,6 +87,14 @@ public class PDSCommand implements CommandExecutor, TabCompleter {
                 sender.sendMessage("\u00A7eStarting migration process...");
                 plugin.startMigration(sender);
                 return true;
+            case "snapshot":
+                plugin.runDailySnapshots(sender);
+                return true;
+            case "snapshots":
+                return handleSnapshots(sender, args);
+            case "rollback":
+                sender.sendMessage("\u00A7eUse \u00A7f/rollbackplayer <player> <survival|fabric> <period>");
+                return true;
             default:
                 sendHelp(sender);
                 return true;
@@ -212,12 +220,53 @@ public class PDSCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage("\u00A77/pds backup export <name> \u00A7f- Export a data backup");
         sender.sendMessage("\u00A77/pds backup import <name> \u00A7f- Import a data backup");
         sender.sendMessage("\u00A77/pds migrate \u00A7f- Start migration to target backend");
+        sender.sendMessage("\u00A77/pds snapshot \u00A7f- Write today's inventory snapshots now");
+        sender.sendMessage("\u00A77/pds snapshots <player> [survival|fabric] \u00A7f- List stored snapshots");
+        sender.sendMessage("\u00A77/rollbackplayer <player> <survival|fabric> <period> \u00A7f- Restore a snapshot");
+    }
+
+    private boolean handleSnapshots(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("\u00A7cUsage: /pds snapshots <player> [survival|fabric]");
+            return true;
+        }
+        org.bukkit.OfflinePlayer target = Bukkit.getOfflinePlayerIfCached(args[1]);
+        if (target == null || target.getUniqueId() == null) {
+            org.bukkit.entity.Player online = Bukkit.getPlayerExact(args[1]);
+            target = online;
+        }
+        if (target == null || target.getName() == null) {
+            sender.sendMessage("\u00A7cUnknown player: " + args[1]);
+            return true;
+        }
+        final org.bukkit.OfflinePlayer resolved = target;
+        String serverId = plugin.getConfig().getString("server-id", "survival");
+        if (args.length >= 3) {
+            try {
+                serverId = de.craftingstudiopro.playerDataSyncReloaded.common.RollbackService.normalizeServerId(args[2]);
+            } catch (IllegalArgumentException ex) {
+                sender.sendMessage("\u00A7c" + ex.getMessage());
+                return true;
+            }
+        }
+        final String sid = serverId;
+        plugin.getSyncManager().getStorage().listSnapshots(resolved.getUniqueId(), sid)
+                .thenAccept(list -> plugin.getPlatform().runTask(() -> {
+                    if (list.isEmpty()) {
+                        sender.sendMessage("\u00A7cNo " + sid + " snapshots for " + resolved.getName());
+                        return;
+                    }
+                    sender.sendMessage("\u00A7b" + sid + " snapshots for " + resolved.getName() + ":");
+                    list.forEach(snap -> sender.sendMessage("\u00A77- \u00A7f"
+                            + de.craftingstudiopro.playerDataSyncReloaded.common.RollbackService.TIME_FMT.format(snap.takenAt)));
+                }));
+        return true;
     }
 
     @Override
     public List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String alias, @NotNull String[] args) {
         if (args.length == 1) {
-            return Arrays.asList("status", "reload", "save", "load", "saveall", "debug", "migrate", "backup").stream()
+            return Arrays.asList("status", "reload", "save", "load", "saveall", "debug", "migrate", "backup", "snapshot", "snapshots", "rollback").stream()
                     .filter(s -> s.startsWith(args[0].toLowerCase()))
                     .collect(Collectors.toList());
         }

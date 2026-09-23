@@ -23,6 +23,7 @@ import dev.faststats.bukkit.BukkitMetrics;
 import dev.faststats.core.Metrics;
 
 import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 
 
 public final class PlayerDataSyncReloaded extends JavaPlugin implements Listener {
@@ -74,10 +75,17 @@ public final class PlayerDataSyncReloaded extends JavaPlugin implements Listener
         getServer().getMessenger().registerOutgoingPluginChannel(this, "pds:sync");
         getServer().getMessenger().registerIncomingPluginChannel(this, "pds:sync", (channel, player, message) -> {
             String msg = new String(message, StandardCharsets.UTF_8);
+            org.bukkit.entity.Player target = resolvePdsTarget(msg, player);
+            if (target == null) {
+                return;
+            }
             if (msg.startsWith("save:")) {
-                syncManager.handleQuit(new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(player));
+                syncManager.handleQuit(
+                        new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(target),
+                        false,
+                        true);
             } else if (msg.startsWith("load:")) {
-                syncManager.handleJoin(new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(player));
+                syncManager.handleJoin(new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(target));
             }
         });
 
@@ -103,6 +111,24 @@ public final class PlayerDataSyncReloaded extends JavaPlugin implements Listener
 
 
         startAutoSaveTask();
+        startSnapshotSchedule();
+
+        org.bukkit.command.PluginCommand rollback = getCommand("rollbackplayer");
+        if (rollback != null) {
+            de.craftingstudiopro.playerDataSyncReloaded.plugin.command.RollbackPlayerCommand rollbackHandler =
+                    new de.craftingstudiopro.playerDataSyncReloaded.plugin.command.RollbackPlayerCommand(this);
+            rollback.setExecutor(rollbackHandler);
+            rollback.setTabCompleter(rollbackHandler);
+        }
+
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            int n = 0;
+            for (org.bukkit.entity.Player player : Bukkit.getOnlinePlayers()) {
+                syncManager.handleQuit(new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(player), true);
+                n++;
+            }
+            getLogger().info("Seeded PlayerDataSync live rows for " + n + " online player(s).");
+        }, 20L * 20);
 
         getLogger().info("PlayerDataSyncReloaded version " + getDescription().getVersion() + " enabled.");
     }
@@ -226,6 +252,22 @@ public final class PlayerDataSyncReloaded extends JavaPlugin implements Listener
             autoSaveTask.cancel();
             autoSaveTask = null;
         }
+        // Paper disables plugins before kicking players / saving player.dat.
+        // Flush inventories to MariaDB first or the next join reloads a stale snapshot.
+        if (syncManager != null) {
+            int n = 0;
+            for (org.bukkit.entity.Player player : Bukkit.getOnlinePlayers()) {
+                syncManager.handleQuit(
+                        new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(player),
+                        false,
+                        true);
+                n++;
+            }
+            if (n > 0) {
+                getLogger().info("Flushing PlayerDataSync data for " + n + " online player(s) before disable.");
+                syncManager.awaitPendingSaves(15_000L);
+            }
+        }
         if (storage != null) {
             storage.close();
         }
@@ -274,6 +316,57 @@ public final class PlayerDataSyncReloaded extends JavaPlugin implements Listener
         return syncManager;
     }
 
+    public de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPlatform getPlatform() {
+        return platform;
+    }
+
+    public void runDailySnapshots(org.bukkit.command.CommandSender sender) {
+        if (syncManager == null || storage == null) {
+            if (sender != null) sender.sendMessage("§cPlayerDataSync is not ready.");
+            return;
+        }
+        String serverId = getConfig().getString("server-id", "survival");
+        int retainDays = getConfig().getInt("snapshots.retain_days", 7);
+        int captured = 0;
+        for (org.bukkit.entity.Player player : Bukkit.getOnlinePlayers()) {
+            de.craftingstudiopro.playerDataSyncReloaded.api.PlayerData data =
+                    versionHandler.capture(new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(player));
+            storage.saveDailySnapshot(serverId, data);
+            captured++;
+        }
+        if (getConfig().getBoolean("snapshots.include_offline_from_db", true)) {
+            storage.getAllStoredUUIDs().thenAccept(uuids -> {
+                for (java.util.UUID uuid : uuids) {
+                    if (Bukkit.getPlayer(uuid) != null) {
+                        continue;
+                    }
+                    storage.load(uuid).thenAccept(opt -> opt.ifPresent(data -> storage.saveDailySnapshot(serverId, data)));
+                }
+            });
+        }
+        storage.pruneSnapshotsOlderThanDays(retainDays).thenAccept(removed ->
+                getLogger().info("Pruned " + removed + " inventory snapshots older than " + retainDays + " day(s)."));
+        if (sender != null) {
+            sender.sendMessage("§aQueued daily snapshots for " + captured + " online player(s) on " + serverId + ".");
+        } else {
+            getLogger().info("Queued daily snapshots for " + captured + " online player(s) on " + serverId + ".");
+        }
+    }
+
+    private void startSnapshotSchedule() {
+        if (!getConfig().getBoolean("snapshots.enabled", true)) {
+            return;
+        }
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            int hour = getConfig().getInt("snapshots.hour_utc", 5);
+            int minute = getConfig().getInt("snapshots.minute", 15);
+            java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC);
+            if (now.getHour() == hour && now.getMinute() == minute) {
+                runDailySnapshots(null);
+            }
+        }, 20L * 60, 20L * 60);
+    }
+
     private void startAutoSaveTask() {
         if (autoSaveTask != null) {
             autoSaveTask.cancel();
@@ -297,6 +390,28 @@ public final class PlayerDataSyncReloaded extends JavaPlugin implements Listener
             }
         }, interval, interval);
     }
+    /**
+     * Velocity {@code RegisteredServer.sendPluginMessage} uses some already-online
+     * player as the messenger. The payload is {@code load:<uuid>} / {@code save:<uuid>}
+     * of the player who actually switched; never apply that to the messenger.
+     */
+    private static org.bukkit.entity.Player resolvePdsTarget(String msg, org.bukkit.entity.Player messenger) {
+        String uuidPart = null;
+        if (msg.startsWith("load:") && msg.length() > 5) {
+            uuidPart = msg.substring(5).trim();
+        } else if (msg.startsWith("save:") && msg.length() > 5) {
+            uuidPart = msg.substring(5).trim();
+        }
+        if (uuidPart == null || uuidPart.isEmpty()) {
+            return messenger;
+        }
+        try {
+            return Bukkit.getPlayer(UUID.fromString(uuidPart));
+        } catch (IllegalArgumentException ignored) {
+            return messenger;
+        }
+    }
+
     @EventHandler(priority = EventPriority.MONITOR)
     public void onJoin(PlayerJoinEvent event) {
         syncManager.handleJoin(new de.craftingstudiopro.playerDataSyncReloaded.plugin.BukkitPDSPlayer(event.getPlayer()));

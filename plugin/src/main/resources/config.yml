@@ -1,5 +1,15 @@
 # Global Settings
 debug: false
+server-id: survival
+
+# Daily per-server inventory snapshots (rolled back with /rollbackplayer)
+snapshots:
+  enabled: true
+  retain_days: 7
+  hour_utc: 5
+  minute: 15
+  # survival should also snapshot offline players from the live synced row
+  include_offline_from_db: true
 
 # Auto-Save Settings (Safe guard against crashes)
 autosave:
@@ -25,7 +35,7 @@ storage:
   username: "root"
   password: ""
   # Connection URL for MongoDB Cloud (Atlas) or advanced setups
-  connection_url: "mongodb+srv://user:pass@host/database"
+  connection_url: ""
 
 # Migration Settings (Used only for /pds migrate command)
 # This is the TARGET storage where data will be moved TO.
@@ -64,10 +74,12 @@ sync:
   statistics: true
   game_mode: true
   flight: true
-  location: false # Teleports the player to their stored position on join. Off by default: the target server must have a world of the same name.
+  location: false
   attributes: true
-  pdc: true # Persistent Data Container
-  economy: true # Vault Economy
+  pdc: false # Paper-only; do not let Fabric null this out
+  economy: false # Fabric has no Vault; saving 0 would wipe survival balances
+  only_save_after_successful_load: false
+  merge_existing_fields: false
   force_save_on_quit: false
   min_save_interval_ms: 0 # 0 = disabled, helpful to reduce autosave spam
   enforce_cooldown_on_quit: false # true = cooldown also applies to normal quit saves

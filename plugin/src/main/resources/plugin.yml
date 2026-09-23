@@ -14,3 +14,7 @@ commands:
     description: Main command for PlayerDataSyncReloaded
     aliases: [pds, pdasync]
     permission: playerdatasync.admin
+  rollbackplayer:
+    description: Rollback a player's inventory snapshot from survival or fabric
+    usage: /rollbackplayer <player> <survival|fabric> <period>
+    permission: playerdatasync.admin

@@ -63,6 +63,9 @@ tasks {
             into("bundled")
             rename { _: String -> "playerdatasync-fabric.jar" }
         }
+        // Hybrid Paper+Fabric jar used on the AZPBMD fabric server: merge remapped
+        // Fabric classes (and fabric.mod.json) into the archive root.
+        from(project.zipTree(project(":fabric-versions:$fabricBundle").tasks.named<AbstractArchiveTask>("remapJar").flatMap { it.archiveFile }))
         if (enableForge) {
             from(project(":forge-versions:$forgeBundle").tasks.named<Jar>("jar").flatMap { it.archiveFile }) {
                 into("bundled")

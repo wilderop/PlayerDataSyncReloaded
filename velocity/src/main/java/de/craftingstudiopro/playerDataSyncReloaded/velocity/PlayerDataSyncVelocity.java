@@ -38,8 +38,12 @@ public class PlayerDataSyncVelocity {
 
     @Subscribe
     public void onServerPreConnect(ServerPreConnectEvent event) {
-        // When a player is switching servers, we notify the source server to save data immediately
+        // When a player is switching servers, we notify the source server to save data immediately.
+        // Fabric cannot decode Velocity plugin messages as vanilla custom payloads (it kicks the client).
         event.getPlayer().getCurrentServer().ifPresent(serverConnection -> {
+            if (isFabric(serverConnection.getServerInfo().getName())) {
+                return;
+            }
             byte[] data = ("save:" + event.getPlayer().getUniqueId()).getBytes(StandardCharsets.UTF_8);
             serverConnection.sendPluginMessage(IDENTIFIER, data);
             logger.info("Triggered fast-save for " + event.getPlayer().getUsername() + " on " + serverConnection.getServerInfo().getName());
@@ -48,9 +52,25 @@ public class PlayerDataSyncVelocity {
 
     @Subscribe
     public void onServerConnected(ServerConnectedEvent event) {
-        // Notify the target server that the player has connected and data should be ready or loaded
+        if (isFabric(event.getServer().getServerInfo().getName())) {
+            return;
+        }
         byte[] data = ("load:" + event.getPlayer().getUniqueId()).getBytes(StandardCharsets.UTF_8);
-        event.getServer().sendPluginMessage(IDENTIFIER, data);
+        // Send through the connecting player. RegisteredServer.sendPluginMessage
+        // picks some other online player as messenger; Paper then reloads THAT
+        // player's inventory on every join.
+        boolean sent = event.getPlayer().getCurrentServer()
+                .map(conn -> conn.sendPluginMessage(IDENTIFIER, data))
+                .orElse(false);
+        if (!sent) {
+            logger.warn("Could not send load notify for " + event.getPlayer().getUsername()
+                    + " on " + event.getServer().getServerInfo().getName());
+            return;
+        }
         logger.info("Notified " + event.getServer().getServerInfo().getName() + " of connection for " + event.getPlayer().getUsername());
+    }
+
+    private static boolean isFabric(String name) {
+        return name != null && name.equalsIgnoreCase("fabric");
     }
 }
