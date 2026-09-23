@@ -1,3 +1,8 @@
+<!-- azpbmd-live -->
+**Live:** survival, velocity, fabric
+
+The servers load this as PlayerDataSync. The AZPBMD build is branch `azpbmd-fabric-sync`.
+<!-- /azpbmd-live -->
 <p align="center">
   <img src="https://img.craftingstudiopro.de/pds_logo.png" alt="PlayerDataSync Reloaded Logo" width="200px">
 </p>
